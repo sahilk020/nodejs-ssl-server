@@ -5,19 +5,63 @@ phases:
     commands:
       - echo Logging in to Amazon ECR...
       - aws --version
+      - aws ssm put-parameter --name "ECS_rollback" --value "${ROLLBACK}" --type "String" --overwrite
+      - aws ssm put-parameter --name "ecs_rollback_path" --value "${ROLLBACK_TAG}" --type "String" --overwrite
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
       - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+      - IMAGE_TAG=${IMAGE_TAG:-latest}
+      - ROLLBACK=${ROLLBACK}
+      - |
+          if [ "$ROLLBACK" = "true" ]; then
+            echo "Rollback mode enabled, using tag: $ROLLBACK_TAG"
+            echo "ROLLBACK_PATH=${ROLLBACK_TAG}"
+          else
+            echo "Normal build mode"
+          fi
+      - |
+        if [ "$ROLLBACK" = "false" ]; then
+          echo "Tagging last image with current date and time..."
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          LAST_IMAGE_URI=$REPOSITORY_URI:latest
+          docker pull $LAST_IMAGE_URI || echo "No previous 'latest' image found in ECR"
+          if docker images -q $LAST_IMAGE_URI | grep -q .; then
+            docker tag $LAST_IMAGE_URI $REPOSITORY_URI:$TIMESTAMP
+          else
+            echo "No previous 'latest' image available to tag"
+          fi
+        fi
+        
   build:
     commands:
       - echo Build started on `date`
-      - echo Building the Docker image...
-      - docker build -t $REPOSITORY_URI:$IMAGE_TAG .
-      - docker tag $REPOSITORY_URI:$IMAGE_TAG $REPOSITORY_URI:$IMAGE_TAG
+      - |
+        if [ "$ROLLBACK" = "false" ]; then
+          echo "Building the Docker image..."
+          docker build -t $REPOSITORY_URI:$IMAGE_TAG .
+          docker tag $REPOSITORY_URI:$IMAGE_TAG $REPOSITORY_URI:${IMAGE_TAG}a
+        else
+          echo "Rollback mode: Skipping build, using existing tag $ROLLBACK_TAG"
+          docker pull $REPOSITORY_URI:$ROLLBACK_TAG || echo "Warning: Could not pull rollback tag $ROLLBACK_TAG"
+          if docker images -q $REPOSITORY_URI:$ROLLBACK_TAG | grep -q .; then
+            docker tag $REPOSITORY_URI:$ROLLBACK_TAG $REPOSITORY_URI:$IMAGE_TAG
+          else
+            echo "Error: Rollback tag $ROLLBACK_TAG not found" && exit 1
+          fi
+        fi
   post_build:
     commands:
       - echo Build completed on `date`
       - echo Pushing the Docker images...
       - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - |
+        if [ "$ROLLBACK" = "false" ]; then
+          if docker images -q $REPOSITORY_URI:$TIMESTAMP | grep -q .; then
+            docker push $REPOSITORY_URI:$TIMESTAMP
+          fi
+          if docker images -q $REPOSITORY_URI:${IMAGE_TAG}a | grep -q .; then
+            docker push $REPOSITORY_URI:${IMAGE_TAG}a
+          fi
+        fi
       - echo Writing image definitions file...
       - printf '[{"name":"%s","imageUri":"%s"}]' $CONTAINER_NAME $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
 
